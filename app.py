@@ -1,139 +1,157 @@
-import streamlit as st
-import requests, smtplib
+import os, requests, streamlit as st, smtplib
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta
 from typing import List, Dict
 from Bio import Entrez
 from langchain_openai import AzureChatOpenAI
 
-# 🔐 CONFIG — replace with your own
-AZURE_ENDPOINT   = "https://YOUR-ENDPOINT.cognitiveservices.azure.com/"
-AZURE_API_KEY    = "YOUR-KEY"
-CHAT_DEPLOY      = "gpt-4o"
-Entrez.email     = "your@email.com"
-SMTP_EMAIL       = "your@gmail.com"
-SMTP_PASSWORD    = "your-app-password"  # NOT your Gmail password
+# ── ENVIRONMENT VARIABLES ─────────────────────────────────────
+ENTREZ_EMAIL      = "you@example.com"
+AZURE_ENDPOINT    = os.environ["AZURE_OPENAI_ENDPOINT"]
+AZURE_KEY         = os.environ["AZURE_OPENAI_KEY"]
+BREVO_SENDER      = {"email": os.environ["BREVO_SENDER_EMAIL"],
+                     "name":  os.environ["BREVO_SENDER_NAME"]}
+BREVO_SMTP_PASS   = os.environ["BREVO_SMTP_PASSWORD"]
+
+MAX_PAPERS_DEFAULT = 8
+MAX_TRIALS_DEFAULT = 5
+Entrez.email = ENTREZ_EMAIL
 
 llm = AzureChatOpenAI(
     azure_endpoint     = AZURE_ENDPOINT,
-    api_key            = AZURE_API_KEY,
-    azure_deployment   = CHAT_DEPLOY,
+    api_key            = AZURE_KEY,
+    azure_deployment   = "gpt-4o",
     openai_api_version = "2024-12-01-preview",
     temperature        = 0,
 )
 
-def fetch_pubmed(topic: str, max_results=10, days=None):
-    params = dict(db="pubmed", term=topic, retmax=max_results)
-    if days:
-        since = (datetime.utcnow() - timedelta(days=days)).strftime("%Y/%m/%d")
-        params.update(dict(mindate=since, datetype="pdat"))
-    ids = Entrez.read(Entrez.esearch(**params))["IdList"]
+# ── DATA FETCH FUNCTIONS ───────────────────────────────────────
+def fetch_pubmed(term: str, max_results: int, lookback_days: int | None) -> List[Dict]:
+    search_args = dict(db="pubmed", term=term, retmax=max_results)
+    if lookback_days:
+        since = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y/%m/%d")
+        search_args.update(dict(mindate=since, datetype="pdat"))
+    ids = Entrez.read(Entrez.esearch(**search_args))["IdList"]
     if not ids:
         return []
     docs = Entrez.read(Entrez.esummary(db="pubmed", id=",".join(ids)))
     return [
-        dict(title=doc.get("Title", "")[:250],
-             date=doc.get("PubDate", "N/A"),
-             url=f"https://pubmed.ncbi.nlm.nih.gov/{doc.get('Id')}/")
+        {
+            "title": doc.get("Title", "")[:250],
+            "date":  doc.get("PubDate", "N/A"),
+            "url":   f"https://pubmed.ncbi.nlm.nih.gov/{doc.get('Id')}/",
+        }
         for doc in docs
     ]
 
-def fetch_trials(condition, keyword, max_results=5):
-    r = requests.get("https://clinicaltrials.gov/api/v2/studies", params={
-        "query.cond": condition,
-        "query.term": keyword,
-        "pageSize":   max_results,
-        "format":     "json"
-    }, timeout=20)
+def fetch_trials(condition: str, keyword: str, max_results: int) -> List[Dict]:
+    r = requests.get(
+        "https://clinicaltrials.gov/api/v2/studies",
+        params={
+            "query.cond": condition,
+            "query.term": keyword,
+            "pageSize":   max_results,
+            "format":     "json",
+        },
+        timeout=20,
+    )
     r.raise_for_status()
-    trials = r.json().get("studies", [])
+    studies = r.json().get("studies", [])
     results = []
-    for s in trials:
+    for s in studies:
         ps = s["protocolSection"]
-        ident = ps["identificationModule"]
+        ident  = ps["identificationModule"]
         status = ps["statusModule"]
-        phase = ps.get("designModule", {}).get("phaseList", {}).get("phase", ["N/A"])[0]
-        results.append({
-            "title": ident.get("officialTitle") or ident.get("briefTitle"),
-            "nct": ident["nctId"],
-            "phase": phase,
-            "start": status.get("startDateStruct", {}).get("startDate", "N/A"),
-            "url": f"https://clinicaltrials.gov/study/{ident['nctId']}"
-        })
+        phase  = ps.get("designModule", {}).get("phaseList", {}).get("phase", ["N/A"])[0]
+        results.append(
+            {
+                "title": ident.get("officialTitle") or ident.get("briefTitle"),
+                "nct":   ident["nctId"],
+                "phase": phase,
+                "start": status.get("startDateStruct", {}).get("startDate", "N/A"),
+                "url":   f"https://clinicaltrials.gov/study/{ident['nctId']}",
+            }
+        )
     return results
 
-def summarize(text: str) -> str:
+def gpt_bullet(text: str) -> str:
     prompt = (
-        "Summarize the following item for a weekly oncology digest in ≤30 words, "
-        "focusing on clinical relevance. Do not fabricate or overstate.\n\n"
-        f"Item:\n{text}\n\nBullet:"
+        "Summarize the following item for an oncology digest in ≤30 words, "
+        "focusing on clinical relevance.\n\nItem:\n"
+        f"{text}\n\nBullet:"
     )
     return llm.invoke(prompt).content.strip()
 
-def generate_digest(papers, trials, topic):
-    today = datetime.now().strftime("%d %b %Y")
-    lines = [
-        f"Subject: Weekly Oncology Digest – {topic} ({today})",
-        "",
-        "Dear Dr. Bukavina,",
-        "",
-        f"Here is your briefing on *{topic}*:",
-        "",
-        "📚 Latest Papers:"
-    ]
-    if papers:
-        for p in papers:
-            bullet = summarize(p['title'])
-            lines.append(f"• {bullet}")
-            lines.append(f"  ({p['date']}) {p['url']}")
-    else:
-        lines.append("  – No new articles found.")
-
-    lines.append("")
-    lines.append("🧪 Clinical Trials:")
-    if trials:
-        for t in trials:
-            bullet = summarize(t['title'])
-            lines.append(f"• {bullet} [{t['phase']}]")
-            lines.append(f"  NCT {t['nct']} — Start {t['start']}")
-            lines.append(f"  {t['url']}")
-    else:
-        lines.append("  – No matching trials found.")
-
-    lines += ["", "Warm regards,", "Your AI Assistant"]
-    return "\n".join(lines)
-
-def send_email(to_email, subject, body):
+# ── EMAIL SENDER (via Brevo SMTP) ──────────────────────────────
+def send_with_brevo(to_email: str, subject: str, body: str):
     msg = MIMEText(body)
     msg["Subject"] = subject
-    msg["From"] = SMTP_EMAIL
+    msg["From"] = f"{BREVO_SENDER['name']} <{BREVO_SENDER['email']}>"
     msg["To"] = to_email
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(SMTP_EMAIL, SMTP_PASSWORD)
+    with smtplib.SMTP("smtp-relay.brevo.com", 587) as server:
+        server.starttls()
+        server.login(BREVO_SENDER["email"], BREVO_SMTP_PASS)
         server.send_message(msg)
 
 # ── STREAMLIT UI ───────────────────────────────────────────────
-st.title("🧬 Weekly Oncology Digest Generator")
-topic = st.text_input("Topic (e.g. ctDNA and bladder cancer)", "ctDNA and bladder cancer")
-email = st.text_input("Recipient Email")
-max_papers = st.slider("Max Papers", 1, 50, 8)
-max_trials = st.slider("Max Trials", 1, 20, 5)
-all_time = st.checkbox("Include all-time PubMed results?", value=False)
+st.title("🧬 Oncology Digest Generator (via Brevo SMTP)")
 
-if st.button("Generate & Send"):
-    with st.spinner("Fetching research..."):
+topic = st.text_input("Search term", "ctDNA bladder cancer")
+recipient = st.text_input("Recipient email")
+max_papers = st.number_input("Max papers", 1, 100, MAX_PAPERS_DEFAULT, step=1)
+max_trials = st.number_input("Max trials", 1, 50, MAX_TRIALS_DEFAULT, step=1)
+lookback = st.selectbox("PubMed window",
+                        ("Past 7 days", "Past 30 days", "All time"))
+days_map = {"Past 7 days": 7, "Past 30 days": 30, "All time": None}
+
+if st.button("Generate digest"):
+    with st.spinner("Collecting literature…"):
         condition = "bladder cancer"
-        keyword = "ctDNA" if "ctDNA" in topic else topic
-        papers = fetch_pubmed(topic, max_papers, None if all_time else 7)
+        keyword   = "ctDNA" if "ctDNA" in topic else topic
+
+        papers = fetch_pubmed(topic, max_papers, days_map[lookback])
         trials = fetch_trials(condition, keyword, max_trials)
-        digest = generate_digest(papers, trials, topic)
 
-    st.success("Digest generated!")
-    st.text_area("Preview", digest, height=400)
+    for p in papers:
+        p["summary"] = gpt_bullet(p["title"])
+    for t in trials:
+        t["summary"] = gpt_bullet(t["title"])
 
-    if email:
-        send_email(email, f"Weekly Oncology Digest – {topic}", digest)
-        st.success(f"Email sent to {email}")
+    today = datetime.now().strftime("%d %b %Y")
+    lines = [
+        f"Subject: Oncology Digest – {topic} ({today})",
+        "",
+        "Dear Dr. Bukavina,",
+        "",
+        f"Here is your digest on *{topic}*:",
+        "",
+        "📚 Papers:"
+    ] + (
+        sum([[f"• {p['summary']}", f"  ({p['date']}) {p['url']}"] for p in papers], [])
+        or ["  – None found."]
+    ) + [
+        "",
+        "🧪 Trials:"
+    ] + (
+        sum([[f"• {t['summary']} [{t['phase']}]",
+              f"  NCT {t['nct']} — Start {t['start']}",
+              f"  {t['url']}"] for t in trials], [])
+        or ["  – None found."]
+    ) + [
+        "",
+        "Regards,",
+        "Oncology AI"
+    ]
+    digest_text = "\n".join(lines)
+
+    st.text_area("Digest Preview", digest_text, height=400)
+
+    if recipient:
+        try:
+            send_with_brevo(recipient, f"Oncology Digest – {topic}", digest_text)
+            st.success(f"Email sent to {recipient}")
+        except Exception as e:
+            st.error(f"Email failed: {e}")
     else:
-        st.warning("Enter an email to send.")
+        st.warning("Please provide a recipient email to send.")
