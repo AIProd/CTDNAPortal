@@ -64,7 +64,7 @@ def send_email(to:str,sub:str,body:str):
 st.title("🧬 Oncology Digest Generator")
 
 topic    = st.text_input("Search term","ctDNA bladder cancer")
-rec_name = st.text_input("Recipient name", placeholder="Enter your name, Example Dr. John Doe")
+rec_name = st.text_input("Recipient name", placeholder="Enter your name, example Dr. John Doe")
 email    = st.text_input("Recipient email")
 papers_n = st.slider("Max papers",1,100,8)
 trials_n = st.slider("Max trials",1,50,5)
